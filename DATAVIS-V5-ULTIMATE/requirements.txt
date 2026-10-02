@@ -1,0 +1,8 @@
+streamlit>=1.30
+pandas>=2.0
+numpy>=1.24
+plotly>=5.18
+openpyxl>=3.1
+pdfplumber>=0.10        # optional: enables PDF table extraction
+langchain-anthropic>=0.1  # optional: enables the AI Insights tab
+PyQt5>=5.15             # only needed to run launcher.py
