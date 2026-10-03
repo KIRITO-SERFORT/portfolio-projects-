@@ -281,7 +281,7 @@ class LauncherApp(QWidget):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         app_path = os.path.join(base_dir, "app.py")
 
-        self.process = subprocess.Popen([sys.executable, "-m", "streamlit", "run", app_path])
+        self.process = subprocess.Popen(["streamlit", "run", app_path])
 
         self.status_label.setText("Starting…")
         self.progress.show()

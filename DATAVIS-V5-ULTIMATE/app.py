@@ -1,26 +1,14 @@
-# DATAVIS v5 ULTIMATE — Data Visualizer & Student Marks Analysis Portal
-# Coded by Arun a.k.a Arun
+# DATAVIS v5 ULTIMATE — data visualizer
 # to run -   streamlit run app.py
 
 import io
 import json
 import datetime
-import hashlib
-import os
 import pandas as pd
 import numpy as np
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from PIL import Image
-
-import auth_db
-import supabase_db
-
-# Initialize local SQLite database
-auth_db.init_db()
-
-LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "datavis_logo.jpg")
 
 try:
     import pdfplumber
@@ -43,14 +31,11 @@ except ImportError:
 
 
 # ============================================================
-# CONSTANTS & CONFIG
+# CONSTANTS
 # ============================================================
 
-LARGE_DATASET_THRESHOLD = 15   # rows above this trigger stacked layout
-HUGE_DATASET_THRESHOLD = 300   # rows above this trigger table pagination
-
-# Payment & Pricing Constants (Indian Rupee ₹)
-UPI_ID = "arun@okaxis"  # Default GPay UPI ID (Configurable in settings)
+LARGE_DATASET_THRESHOLD = 15   # rows above this trigger the stacked, full-width chart layout
+HUGE_DATASET_THRESHOLD = 300   # rows above this trigger sampling/pagination for tables
 
 PALETTES = {
     "Vivid":        px.colors.qualitative.Vivid,
@@ -86,18 +71,24 @@ THEME_PRESETS = {
 # ============================================================
 
 def anonymize_names(df, name_col):
-    """Replaces every value in name_col with a generic placeholder ('Entity 1', 'Entity 2', ...)."""
+    """Replaces every value in name_col with a generic placeholder ('Entity 1', 'Entity 2', ...)
+    so real names never have to leave the app. Returns (anonymized_df, real_to_placeholder_map)."""
     anon_df = df.copy()
-    if name_col and name_col in anon_df.columns:
-        unique_names = anon_df[name_col].astype(str).unique().tolist()
-        mapping = {name: f"Entity {i + 1}" for i, name in enumerate(unique_names)}
-        anon_df[name_col] = anon_df[name_col].astype(str).map(mapping)
-        return anon_df, mapping
-    return anon_df, {}
+    unique_names = anon_df[name_col].astype(str).unique().tolist()
+    mapping = {name: f"Entity {i + 1}" for i, name in enumerate(unique_names)}
+    anon_df[name_col] = anon_df[name_col].astype(str).map(mapping)
+    return anon_df, mapping
 
 
 def get_ai_summary(df, api_key, name_col=None, include_raw_rows=False):
-    """Sends dataset stats to Claude and asks for a plain-language analysis."""
+    """Sends dataset stats (and, only if explicitly opted into, row-level data) to Claude
+    and asks for a plain-language analysis.
+
+    Privacy: row-level data is never sent unless include_raw_rows=True, and even then, if a
+    name_col is provided, names are replaced with anonymous placeholders ('Entity 1', 'Entity 2', ...)
+    before anything leaves the app. The response is translated back to real names afterward so it's
+    still readable locally.
+    """
     if not AI_SUPPORT:
         return None, "langchain_anthropic is not installed in this environment."
     try:
@@ -112,27 +103,32 @@ def get_ai_summary(df, api_key, name_col=None, include_raw_rows=False):
         mapping = {}
         raw_data_section = ""
         if include_raw_rows:
-            if name_col and name_col in df.columns:
+            if name_col:
                 anon_df, mapping = anonymize_names(df, name_col)
                 raw_data_section = f"\nRaw data (names replaced with anonymous placeholders):\n{anon_df.to_string()}\n"
             else:
                 raw_data_section = f"\nRaw data:\n{df.to_string()}\n"
 
         prompt = f"""
-You are an expert data analyst. Analyze this dataset:
-Columns: {columns_info}
+You are a data analyst. You will be given a dataset with these columns: {columns_info}
 
 Summary statistics:
 {summary_stats}
 {raw_data_section}
+First, briefly identify what kind of data this appears to be (e.g. academic performance, business/sales, health/fitness, or another domain) based on the column names and values.
 
-Provide:
-1. Key findings and highest/lowest performing entities/metrics.
-2. Areas of weakness or subjects where scores trail.
-3. Actionable recommendations for improvement.
+Then, based on that context, provide:
+1. Which rows (entities) perform best and which perform worst overall, using the most relevant numeric columns as the basis for "performance"
+2. Specific columns/metrics where the weaker entities fall short
+3. Practical, actionable advice for improving the weaker entities' outcomes
+
+{"Refer to entities using whatever placeholder labels appear in the raw data (e.g. 'Entity 3') since real names were not shared with you." if include_raw_rows and name_col else "No row-level data was shared with you, so keep the analysis at the level of columns/metrics rather than naming individual entities."}
+Keep your analysis grounded strictly in the data provided — do not invent figures or assume information not present in the table.
 """
         response = llm.invoke([HumanMessage(content=prompt)])
         text = response.content
+        # Translate anonymous placeholders back to real names for local display only —
+        # the substitution happens after the API call, so Claude itself never saw the real names.
         if mapping:
             reverse_map = {v: k for k, v in mapping.items()}
             for placeholder, real_name in reverse_map.items():
@@ -143,7 +139,9 @@ Provide:
 
 
 def extract_pdf_tables(file):
-    """Extracts tables found in a PDF using pdfplumber."""
+    """Extracts every table found in a PDF using pdfplumber. Returns a list of
+    (dataframe, page_number, table_number_on_page) tuples. First row of each
+    extracted table is used as the header."""
     file.seek(0)
     results = []
     with pdfplumber.open(file) as pdf:
@@ -155,6 +153,7 @@ def extract_pdf_tables(file):
                 header, *rows = table
                 header = [str(h).strip() if h else f"col_{i}" for i, h in enumerate(header)]
                 tdf = pd.DataFrame(rows, columns=header)
+                # try to coerce numeric-looking columns
                 for c in tdf.columns:
                     coerced = pd.to_numeric(tdf[c].astype(str).str.replace(",", ""), errors="coerce")
                     if coerced.notna().sum() >= len(tdf) * 0.6:
@@ -164,7 +163,9 @@ def extract_pdf_tables(file):
 
 
 def load_file(file):
-    """Reads uploaded CSV, Excel, or PDF into DataFrames."""
+    """Reads an uploaded file (CSV, Excel, or PDF) into one or more DataFrames.
+    Returns a list of (label, dataframe) pairs, since a PDF can contain several
+    tables while CSV/Excel always yields exactly one."""
     file.seek(0)
     name = file.name.lower()
     if name.endswith('.csv'):
@@ -173,66 +174,34 @@ def load_file(file):
         return [(file.name, pd.read_excel(file))]
     elif name.endswith('.pdf'):
         if not PDF_SUPPORT:
-            st.error("PDF support requires the `pdfplumber` package.")
+            st.error("PDF support requires the `pdfplumber` package, which isn't installed here.")
             return []
         tables = extract_pdf_tables(file)
         if not tables:
-            st.warning(f"No tables detected in **{file.name}**.")
+            st.warning(f"No tables could be detected in **{file.name}**.")
             return []
-        return [(f"{file.name} (p{page}-t{tnum})", tdf) for tdf, page, tnum in tables]
+        return [
+            (f"{file.name} (p{page}-t{tnum})", tdf)
+            for tdf, page, tnum in tables
+        ]
     else:
         st.error(f"Unsupported file type: {file.name}")
         return []
 
 
-def generate_sample_marks_data():
-    """Generates a sample student marks dataframe for 1-click testing."""
-    np.random.seed(42)
-    names = ["Aarav Sharma", "Ananya Verma", "Rohan Gupta", "Priya Patel", "Vikram Singh",
-             "Neha Reddy", "Aditya Kumar", "Sneha Iyer", "Karan Malhotra", "Riya Sen"]
-    data = {
-        "Roll No": [101 + i for i in range(len(names))],
-        "Student Name": names,
-        "Mathematics": [92, 85, 78, 65, 95, 88, 72, 98, 54, 81],
-        "Physics": [88, 90, 82, 70, 91, 84, 68, 96, 60, 79],
-        "Chemistry": [90, 84, 75, 68, 89, 86, 74, 94, 58, 83],
-        "English": [94, 88, 80, 75, 92, 90, 81, 95, 71, 87],
-        "Computer Science": [96, 92, 85, 78, 98, 91, 79, 99, 65, 89]
-    }
-    return pd.DataFrame(data)
-
-
-def compute_student_grades(df, numeric_cols, name_col=None):
-    """Computes Total Marks, Average Score %, Grade (A+, A, B, C, D, Fail), and Rank."""
-    out_df = df.copy()
-    valid_metrics = [c for c in numeric_cols if not _looks_like_identifier_column(df, c)]
-    if not valid_metrics:
-        return out_df
-
-    out_df["Total Marks"] = out_df[valid_metrics].sum(axis=1)
-    out_df["Average %"] = out_df[valid_metrics].mean(axis=1).round(2)
-
-    def get_grade(avg):
-        if avg >= 90: return "A+ (Outstanding)"
-        elif avg >= 80: return "A (Excellent)"
-        elif avg >= 70: return "B (Good)"
-        elif avg >= 60: return "C (Average)"
-        elif avg >= 50: return "D (Pass)"
-        else: return "F (Fail)"
-
-    out_df["Grade"] = out_df["Average %"].apply(get_grade)
-    out_df["Class Rank"] = out_df["Average %"].rank(ascending=False, method="min").astype(int)
-    out_df = out_df.sort_values("Class Rank")
-    return out_df
-
-
 def growth_pct(first_score, last_score):
+    """Returns % growth from first_score to last_score, or None if not computable."""
     if pd.isna(first_score) or pd.isna(last_score) or first_score == 0:
         return None
     return round(((last_score - first_score) / first_score) * 100, 2)
 
 
 def subject_scale_changed(long_df, subject, first_semester, last_semester, tolerance=0.10):
+    """Checks whether a subject's apparent maximum marks shifted between two semesters
+    (e.g. exam went from out of 50 to out of 100). Uses the observed max score within each
+    semester as a proxy for 'marks out of'. Returns True if the two maxima differ by more than
+    `tolerance` (10% by default) — in which case a raw % growth number is not meaningful,
+    since part of the change is just a different scale, not actual improvement."""
     first_max = long_df.loc[
         (long_df['Subject'] == subject) & (long_df['__Semester__'] == first_semester), 'Score'
     ].max()
@@ -241,12 +210,12 @@ def subject_scale_changed(long_df, subject, first_semester, last_semester, toler
     ].max()
     if pd.isna(first_max) or pd.isna(last_max) or first_max == 0 or last_max == 0:
         return False
-    return abs((last_max / first_max) - 1) > tolerance
+    ratio = last_max / first_max
+    return abs(ratio - 1) > tolerance
 
 
 def find_student_row(df, name_col, search_name):
-    if not search_name or not name_col or name_col not in df.columns:
-        return None, 0
+    """Case-insensitive, whitespace-tolerant name lookup. Returns (row_or_None, match_count)."""
     matches = df[df[name_col].astype(str).str.strip().str.lower() == search_name.strip().lower()]
     if matches.empty:
         return None, 0
@@ -254,10 +223,17 @@ def find_student_row(df, name_col, search_name):
 
 
 def bar_chart_height(n_categories, per_category_px=28, min_height=420, max_height=1400):
+    """Scales bar chart height with the number of categories so long name lists stay readable."""
     return int(min(max_height, max(min_height, n_categories * per_category_px)))
 
 
+# ------------------------------------------------------------
+# NEW UTILITIES — v3/v4
+# ------------------------------------------------------------
+
 def global_search(df, query):
+    """Case-insensitive substring search across every column of df. Returns the
+    matching subset. Empty query returns df unchanged."""
     if not query:
         return df
     q = query.strip().lower()
@@ -266,6 +242,9 @@ def global_search(df, query):
 
 
 def detect_outliers_iqr(df, numeric_cols, k=1.5):
+    """Flags outlier rows per numeric column using the IQR rule. Returns a summary
+    dataframe (column, lower/upper bound, outlier count) and a combined boolean
+    mask of rows that are an outlier on at least one column."""
     rows = []
     combined_mask = pd.Series(False, index=df.index)
     for col in numeric_cols:
@@ -285,6 +264,8 @@ def detect_outliers_iqr(df, numeric_cols, k=1.5):
 
 
 def clean_dataframe(df, drop_dupes, fillna_strategy, fillna_cols, drop_empty_cols, strip_whitespace):
+    """Applies a set of light-touch cleaning operations chosen in the UI and returns
+    (cleaned_df, list_of_change_descriptions) so the user sees exactly what changed."""
     log = []
     out = df.copy()
 
@@ -299,7 +280,7 @@ def clean_dataframe(df, drop_dupes, fillna_strategy, fillna_cols, drop_empty_col
         empty_cols = [c for c in out.columns if out[c].isna().all()]
         if empty_cols:
             out = out.drop(columns=empty_cols)
-            log.append(f"Dropped {len(empty_cols)} fully-empty column(s).")
+            log.append(f"Dropped {len(empty_cols)} fully-empty column(s): {', '.join(empty_cols)}")
 
     if drop_dupes:
         before = len(out)
@@ -327,25 +308,30 @@ _ID_LIKE_NAME_PATTERNS = ("id", "roll", "no.", "number", "code", "index", "rank"
 
 
 def _looks_like_identifier_column(df, col):
+    """Heuristic check for columns that are numeric but not really a 'metric' — roll numbers,
+    IDs, ranks, phone numbers, etc. These shouldn't be averaged/compared against real metrics
+    like marks, since 'highest average Roll No' is a technically-true but meaningless insight."""
     name_lower = str(col).strip().lower()
     if any(pat in name_lower for pat in _ID_LIKE_NAME_PATTERNS):
         return True
     series = df[col].dropna()
     if series.empty:
         return False
-    # Heuristic: all unique integers look like IDs — BUT if values are in a
-    # typical marks/percentage range (0–150) they are almost certainly scores,
-    # not identifiers (e.g. "Mathematics": [92, 85, 78, …]).
-    if pd.api.types.is_numeric_dtype(series):
-        col_min, col_max = series.min(), series.max()
-        if col_min >= 0 and col_max <= 150:
-            return False   # Score/percentage range — definitely not an ID
+    # near-unique integer-looking column (e.g. roll numbers, serial IDs) — every value distinct
     if series.nunique() >= max(1, int(len(series) * 0.98)) and (series % 1 == 0).all():
         return True
     return False
 
 
 def auto_insights(df, numeric_cols, name_col=None):
+    """Generates a short list of plain-language, non-AI bullet insights purely from
+    the data itself: best/worst columns, spread, and skew — a free fallback to the
+    paid AI Insights tab.
+
+    Only columns that look like genuine, comparable metrics (not IDs/roll numbers/ranks) are
+    used for "highest/lowest average" style claims, since those are only meaningful when the
+    columns being compared measure the same kind of thing.
+    """
     bullets = []
     if not numeric_cols:
         return ["No numeric columns available to summarize."]
@@ -354,33 +340,48 @@ def auto_insights(df, numeric_cols, name_col=None):
     excluded_cols = [c for c in numeric_cols if c not in metric_cols]
 
     if not metric_cols:
-        return ["No numeric columns look like performance metrics (others look like IDs/roll numbers)."]
+        return ["No numeric columns look like comparable metrics (the rest look like IDs/roll numbers/ranks)."]
 
     means = df[metric_cols].mean(numeric_only=True)
     stds = df[metric_cols].std(numeric_only=True)
 
-    if not means.empty:
-        top_col = means.idxmax()
-        bullets.append(f"**{top_col}** has the highest class average ({means[top_col]:.2f}).")
-        if len(means) > 1:
-            low_col = means.idxmin()
-            bullets.append(f"**{low_col}** has the lowest class average ({means[low_col]:.2f}) — needs focus.")
+    top_col = means.idxmax()
+    bullets.append(f"**{top_col}** has the highest average ({means[top_col]:.2f}) among comparable metric columns.")
 
-    if not stds.empty:
-        most_var = stds.idxmax()
-        bullets.append(f"**{most_var}** shows the highest score spread (std dev {stds[most_var]:.2f}).")
+    if len(means) > 1:
+        low_col = means.idxmin()
+        bullets.append(f"**{low_col}** has the lowest average ({means[low_col]:.2f}) — worth a closer look.")
 
-    if name_col and name_col in df.columns:
+    most_variable = stds.idxmax() if not stds.empty else None
+    if most_variable:
+        bullets.append(f"**{most_variable}** shows the most spread (std dev {stds[most_variable]:.2f}), "
+                        f"meaning entities differ widely on this metric.")
+
+    if name_col:
         for col in metric_cols[:1]:
             top_row = df.loc[df[col].idxmax()]
             bot_row = df.loc[df[col].idxmin()]
-            bullets.append(f"On **{col}**, **{top_row[name_col]}** leads ({top_row[col]}) while **{bot_row[name_col]}** trails ({bot_row[col]}).")
+            bullets.append(f"On **{col}**, **{top_row[name_col]}** leads ({top_row[col]}) while "
+                            f"**{bot_row[name_col]}** trails ({bot_row[col]}).")
 
-    bullets.append(f"Dataset contains **{len(df)}** student/entity row(s) across **{len(metric_cols)}** metric column(s).")
+    n_rows = len(df)
+    bullets.append(f"Dataset contains **{n_rows}** row(s) across **{len(metric_cols)}** comparable numeric metric(s).")
+    if excluded_cols:
+        bullets.append(
+            f"ℹ️ Excluded from the comparisons above (look like IDs/roll numbers/ranks, not performance metrics): "
+            f"{', '.join(f'**{c}**' for c in excluded_cols)}."
+        )
+    bullets.append(
+        "⚠️ Note: even among the metric columns above, averages are only meaningful to compare "
+        "*to each other* if the columns share the same scale (e.g. both out of 100). A metric out "
+        "of 50 will look artificially 'lower' next to one out of 100 even if performance is identical."
+    )
     return bullets
 
 
 def build_excel_report(named_dfs, primary_label, df, numeric_cols):
+    """Bundles raw data (per file), a stats summary, and a correlation matrix into
+    a single downloadable multi-sheet Excel workbook."""
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         for label, tdf in named_dfs:
@@ -395,37 +396,48 @@ def build_excel_report(named_dfs, primary_label, df, numeric_cols):
 
 
 def build_radar_figure(df, radar_cols, row_indices, label_col, colors):
+    """Builds a Plotly radar (polar) figure for the given rows and metric columns."""
     fig_radar = go.Figure()
     for i, idx in enumerate(row_indices):
-        if idx in df.index:
-            r_values = df.loc[idx, radar_cols].tolist()
-            r_values += [r_values[0]]
-            categories = radar_cols + [radar_cols[0]]
-            label_text = str(df.loc[idx, label_col]) if (label_col and label_col in df.columns) else f"Row {idx}"
-            fig_radar.add_trace(go.Scatterpolar(
-                r=r_values, theta=categories, fill='toself', name=label_text,
-                line=dict(color=colors[i % len(colors)])
-            ))
+        r_values = df.loc[idx, radar_cols].tolist()
+        r_values += [r_values[0]]  # close the loop
+        categories = radar_cols + [radar_cols[0]]
+        fig_radar.add_trace(go.Scatterpolar(
+            r=r_values, theta=categories, fill='toself',
+            name=str(df.loc[idx, label_col]) if label_col else f"Row {idx}",
+            line=dict(color=colors[i % len(colors)])
+        ))
     fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True)), showlegend=True)
     return fig_radar
 
 
 def check_file_compatibility(named_dfs):
+    """Compares columns across a list of (label, df) pairs. Returns a dict with
+    'all_match' (bool), 'common_cols' (list shared by every file), and a per-file
+    column report — used to decide whether files can be auto-combined or whether
+    the user needs to pick which shared rows/columns to use."""
     col_sets = [set(df.columns) for _, df in named_dfs]
     common = set.intersection(*col_sets) if col_sets else set()
     all_match = all(cs == col_sets[0] for cs in col_sets)
-    report = [{"file": label, "columns": len(df.columns), "rows": len(df)} for label, df in named_dfs]
+    report = [
+        {"file": label, "columns": len(df.columns), "rows": len(df)}
+        for label, df in named_dfs
+    ]
+    # preserve original column order for the common set, using the first file as reference
     ordered_common = [c for c in named_dfs[0][1].columns if c in common] if named_dfs else []
     return {"all_match": all_match, "common_cols": ordered_common, "report": report}
 
 
 def apply_plotly_theme(fig, dark_mode):
+    """Applies a consistent dark/light template to a figure without touching its data/colors."""
     fig.update_layout(template="plotly_dark" if dark_mode else "plotly_white")
     return fig
 
 
 def render_flexible_chart(df, chart_type, x_col, y_col, color_col, colors, cont_scale,
                            horizontal, sort_desc, dark_mode, title, height=None):
+    """One entry point for every 'customizable' chart on the Explore tab — swaps chart
+    type, orientation, sort order, and color scheme without duplicating plotting code."""
     plot_df = df.copy()
     if sort_desc and y_col in plot_df.columns and pd.api.types.is_numeric_dtype(plot_df[y_col]):
         plot_df = plot_df.sort_values(y_col, ascending=False)
@@ -437,7 +449,8 @@ def render_flexible_chart(df, chart_type, x_col, y_col, color_col, colors, cont_
     xa, ya = (y_col, x_col) if horizontal and chart_type in ("Bar", "Box", "Violin") else (x_col, y_col)
 
     if chart_type == "Bar":
-        fig = px.bar(plot_df, x=xa, y=ya, color=color_arg, title=title, orientation="h" if horizontal else "v", **color_kwargs)
+        fig = px.bar(plot_df, x=xa, y=ya, color=color_arg, title=title,
+                     orientation="h" if horizontal else "v", **color_kwargs)
     elif chart_type == "Line":
         fig = px.line(plot_df, x=x_col, y=y_col, color=color_arg, markers=True, title=title, **color_kwargs)
     elif chart_type == "Area":
@@ -463,88 +476,39 @@ def render_flexible_chart(df, chart_type, x_col, y_col, color_col, colors, cont_
 
 
 # ============================================================
-# PAGE SETUP + SESSION STATE
+# PAGE SETUP + UI THEME
 # ============================================================
 
 st.set_page_config(page_title="DATAVIS v5 ULTIMATE", page_icon="📊", layout="wide")
 
-if "user" not in st.session_state:
-    st.session_state.user = None
 if "dark_mode" not in st.session_state:
     st.session_state.dark_mode = True
 if "theme_preset" not in st.session_state:
     st.session_state.theme_preset = "Midnight Violet"
 if "compact_mode" not in st.session_state:
     st.session_state.compact_mode = False
-if "charged_session_id" not in st.session_state:
-    st.session_state.charged_session_id = None
-if "sample_data_loaded" not in st.session_state:
-    st.session_state.sample_data_loaded = False
-
-
-# ============================================================
-# SIDEBAR: BRANDING, APPEARANCE & USER INFO
-# ============================================================
 
 with st.sidebar:
-    if os.path.exists(LOGO_PATH):
-        st.image(LOGO_PATH, width='stretch')
-
-    st.markdown("<h2 style='text-align:center; margin-top:-10px;'>DATAVIS v5</h2>", unsafe_allow_html=True)
-    st.markdown(
-        "<div style='text-align:center; font-size:12px; color:#18C6C6; margin-bottom:15px; font-weight:600;'>"
-        "✨ Created by Arun a.k.a Arun"
-        "</div>",
-        unsafe_allow_html=True
-    )
-
-    st.header("🎨 Appearance & Settings")
+    st.header("🎨 Appearance")
     dark_mode = st.toggle("Dark mode", value=st.session_state.dark_mode)
     st.session_state.dark_mode = dark_mode
     theme_preset = st.selectbox("Theme preset", list(THEME_PRESETS.keys()),
                                  index=list(THEME_PRESETS.keys()).index(st.session_state.theme_preset))
     st.session_state.theme_preset = theme_preset
-    compact_mode = st.toggle("Compact layout", value=st.session_state.compact_mode)
+    compact_mode = st.toggle("Compact layout", value=st.session_state.compact_mode,
+                              help="Tighter spacing and smaller headers — useful on laptop screens.")
     st.session_state.compact_mode = compact_mode
-
     palette_name = st.selectbox("Color palette (categories)", list(PALETTES.keys()), index=0)
     cont_scale_name = st.selectbox("Color scale (numeric gradients)", list(CONTINUOUS_SCALES.keys()), index=0)
     COLOR_SEQUENCE = PALETTES[palette_name]
     CONT_SCALE = CONTINUOUS_SCALES[cont_scale_name]
     accent = COLOR_SEQUENCE[0]
 
-    st.divider()
-
-    # User Auth Status Panel in Sidebar
-    if st.session_state.user:
-        user_info = auth_db.get_user_by_id(st.session_state.user['id'])
-        if user_info:
-            st.session_state.user = user_info
-        else:
-            st.session_state.user = None
-
-    if st.session_state.user:
-        u = st.session_state.user
-        st.markdown(f"### 👤 Account Profile")
-        st.markdown(f"**{u['name']}**  \n`<span style='color:#a39fc0;'>{u['email']}</span>`", unsafe_allow_html=True)
-
-        turns = u.get('turns_remaining', 0)
-        is_paid = u.get('is_paid_tier', 0)
-
-        # Do NOT explicitly reveal turn counter to user unless exhausted!
-        if turns <= 0:
-            st.error("🚨 **0 Free Analyses Left** (Top up for ₹20)")
-
-        if st.button("🚪 Sign Out", key="sidebar_logout"):
-            st.session_state.user = None
-            st.session_state.charged_session_id = None
-            st.rerun()
-
 preset = THEME_PRESETS[theme_preset]
 if dark_mode:
     bg1, bg2 = preset["bg1"], preset["bg2"]
     if preset["bg1"].startswith("#f") or preset["bg1"].startswith("#fb"):
-        bg1, bg2 = "#0e0e17", "#161625"
+        bg1, bg2 = "#0e0e17", "#161625"  # guard against picking a light preset while dark mode is on
     card_bg, text_col, muted = "rgba(255,255,255,0.04)", "#f0eefc", "#a39fc0"
 else:
     bg1, bg2, card_bg, text_col, muted = "#f7f7fb", "#ffffff", "rgba(0,0,0,0.02)", "#1b1b2b", "#5c5876"
@@ -571,26 +535,55 @@ h2, h3 {{
     transition: border-color 0.25s ease-in-out;
     color: {text_col};
 }}
+h2:hover, h3:hover {{ border-left-color: {COLOR_SEQUENCE[1 % len(COLOR_SEQUENCE)]}; }}
 
+div[data-testid="stPlotlyChart"] {{
+    border-radius: 14px;
+    padding: 8px;
+    background: {card_bg};
+    transition: box-shadow 0.25s ease-in-out, transform 0.2s ease-in-out;
+    border: 1px solid rgba(128,128,128,0.12);
+}}
+div[data-testid="stPlotlyChart"]:hover {{
+    box-shadow: 0 6px 22px rgba(124, 77, 255, 0.25);
+    transform: translateY(-2px);
+}}
+
+[data-testid="stAppViewContainer"] {{ animation: fadeIn 0.6s ease-in; }}
+@keyframes fadeIn {{ from {{ opacity: 0; }} to {{ opacity: 1; }} }}
+
+div[data-testid="stAlert"] {{ border-radius: 10px; }}
+
+section[data-testid="stSidebar"] {{
+    border-right: 2px solid rgba(128,128,128,0.2);
+}}
+
+button[data-baseweb="tab"] {{ font-weight: 600; }}
+
+/* metric-style cards used in the compatibility report */
 .dv-card {{
     background: {card_bg};
     border: 1px solid rgba(128,128,128,0.15);
-    border-radius: 14px;
-    padding: {compact_pad} 18px;
-    margin-bottom: 10px;
-    box-shadow: 0 4px 14px rgba(0,0,0,0.15);
+    border-radius: 12px;
+    padding: {compact_pad} 16px;
+    margin-bottom: 8px;
+    transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
 }}
+.dv-card:hover {{ transform: translateY(-2px); box-shadow: 0 6px 18px rgba(0,0,0,0.18); }}
 
+/* KPI stat row shown at the top once data is loaded */
 .dv-kpi {{
     background: linear-gradient(135deg, {card_bg}, rgba(128,128,128,0.05));
     border: 1px solid rgba(128,128,128,0.15);
     border-left: 4px solid {accent2};
     border-radius: 12px;
     padding: 14px 16px;
+    text-align: left;
 }}
-.dv-kpi .dv-kpi-label {{ font-size: 12px; color: {muted}; text-transform: uppercase; letter-spacing:0.05em; }}
+.dv-kpi .dv-kpi-label {{ font-size: 12px; color: {muted}; text-transform: uppercase; letter-spacing: 0.05em; }}
 .dv-kpi .dv-kpi-value {{ font-size: 24px; font-weight: 800; color: {text_col}; }}
 
+/* insight bullets in Dashboard tab */
 .dv-insight {{
     background: {card_bg};
     border-left: 3px solid {accent2};
@@ -598,205 +591,82 @@ h2, h3 {{
     padding: 10px 14px;
     margin-bottom: 6px;
     color: {text_col};
-}}
-
-.dv-auth-hero {{
-    background: linear-gradient(135deg, {card_bg}, {accent2}22);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 18px;
-    padding: 35px;
-    margin-bottom: 25px;
-    text-align: center;
-}}
-
-.dv-about-hero {{
-    background: linear-gradient(135deg, {card_bg}, {accent2}18);
-    border: 1px solid rgba(255,255,255,0.10);
-    border-radius: 18px;
-    padding: 32px 36px;
-    margin-bottom: 22px;
-    text-align: center;
-    box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    font-size: 14px;
 }}
 
 .dv-tag {{
     display: inline-block;
-    background: {accent2}28;
-    border: 1px solid {accent2}60;
-    color: {accent2};
-    border-radius: 20px;
-    padding: 4px 12px;
+    background: rgba(128,128,128,0.15);
+    border-radius: 999px;
+    padding: 2px 10px;
+    font-size: 11px;
+    margin-right: 6px;
+    color: {muted};
+}}
+
+.dv-byline {{
+    display: inline-block;
+    background: linear-gradient(90deg, {accent2}22, transparent);
+    border: 1px solid {accent2}55;
+    border-radius: 999px;
+    padding: 3px 12px;
+    font-size: 12px;
+    color: {text_col};
+    margin-top: 4px;
+}}
+
+.dv-about-hero {{
+    background: linear-gradient(135deg, {card_bg}, {accent2}11);
+    border: 1px solid rgba(128,128,128,0.15);
+    border-radius: 16px;
+    padding: 22px 26px;
+    margin-bottom: 16px;
+}}
+.dv-about-hero h2 {{ margin: 0 0 4px 0; color: {text_col}; }}
+.dv-about-hero .handle {{ color: {accent2}; font-weight: 700; }}
+
+.dv-feature-pill {{
+    display: inline-block;
+    background: {card_bg};
+    border: 1px solid rgba(128,128,128,0.18);
+    border-radius: 10px;
+    padding: 8px 12px;
+    margin: 4px 6px 4px 0;
     font-size: 13px;
-    font-weight: 600;
-    margin: 3px 4px;
+    color: {text_col};
 }}
-
-.dv-medal-gold {{
-    background: linear-gradient(135deg, #ffd700, #ffbf00, #e6a900);
-    border-radius: 14px; padding: 16px 18px; text-align: center;
-    box-shadow: 0 4px 18px rgba(255,215,0,0.25); border: 1px solid #ffd700;
-}}
-.dv-medal-silver {{
-    background: linear-gradient(135deg, #c0c0c0, #a8a8a8, #909090);
-    border-radius: 14px; padding: 16px 18px; text-align: center;
-    box-shadow: 0 4px 14px rgba(192,192,192,0.20); border: 1px solid #c0c0c0;
-}}
-.dv-medal-bronze {{
-    background: linear-gradient(135deg, #cd7f32, #b87333, #a0652a);
-    border-radius: 14px; padding: 16px 18px; text-align: center;
-    box-shadow: 0 4px 14px rgba(205,127,50,0.20); border: 1px solid #cd7f32;
-}}
-.dv-medal-name {{ font-size: 17px; font-weight: 800; color: #1a1a1a; margin: 6px 0 2px; }}
-.dv-medal-score {{ font-size: 13px; color: #2a2a2a; font-weight: 600; }}
-.dv-medal-grade {{ font-size: 12px; color: #333; margin-top: 2px; }}
-
-.dv-badge {{
-    display: inline-block; padding: 3px 10px; border-radius: 20px;
-    font-size: 12px; font-weight: 700; letter-spacing: 0.03em;
-}}
-.dv-badge-aplus  {{ background: #38f5b022; color: #38f5b0; border: 1px solid #38f5b060; }}
-.dv-badge-a      {{ background: #7C4DFF22; color: #7C4DFF; border: 1px solid #7C4DFF60; }}
-.dv-badge-b      {{ background: #18C6C622; color: #18C6C6; border: 1px solid #18C6C660; }}
-.dv-badge-c      {{ background: #FFB90022; color: #FFB900; border: 1px solid #FFB90060; }}
-.dv-badge-d      {{ background: #FF6EC722; color: #FF6EC7; border: 1px solid #FF6EC760; }}
-.dv-badge-f      {{ background: #FF444422; color: #FF4444; border: 1px solid #FF444460; }}
 </style>
 """, unsafe_allow_html=True)
 
-
-# ============================================================
-# LANDING & LOGIN / SIGN UP VIEW (If not logged in)
-# ============================================================
-
-if not st.session_state.user:
-    col_l1, col_l2 = st.columns([1, 4])
-    with col_l1:
-        if os.path.exists(LOGO_PATH):
-            st.image(LOGO_PATH, width=130)
-    with col_l2:
-        st.title("DATAVIS v5 ULTIMATE 📊")
-        st.markdown(
-            "<span style='font-size:16px; color:#18C6C6; font-weight:600;'>"
-            "Created by <b>Arun a.k.a Arun</b></span>",
-            unsafe_allow_html=True
-        )
-
-    st.markdown("""
-    <div class='dv-auth-hero'>
-        <h2 style='border:none; margin:0;'>Smart Data & Student Performance Visualizer</h2>
-        <p style='font-size: 16px; margin-top: 10px; color:#a39fc0;'>
-            Turn student marks, spreadsheets, and academic records into interactive charts, grade analytics, and reports instantly.
-        </p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    auth_tab1, auth_tab2 = st.tabs(["🔑 Sign In", "📝 Create Free Account"])
-
-    with auth_tab1:
-        st.subheader("Welcome Back!")
-        with st.form("login_form"):
-            login_email = st.text_input("Email Address")
-            login_password = st.text_input("Password", type="password")
-            submit_login = st.form_submit_button("Sign In to Portal")
-
-            if submit_login:
-                success, msg, user_dict = auth_db.authenticate_user(login_email, login_password)
-                if success:
-                    st.session_state.user = user_dict
-                    supabase_db.sync_user_to_supabase(user_dict)
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
-
-    with auth_tab2:
-        st.subheader("Create an Account")
-        with st.form("signup_form"):
-            reg_name = st.text_input("Full Name")
-            reg_email = st.text_input("Email Address")
-            reg_password = st.text_input("Password (min. 6 chars)", type="password")
-            reg_confirm = st.text_input("Confirm Password", type="password")
-            submit_reg = st.form_submit_button("Register Account")
-
-            if submit_reg:
-                if reg_password != reg_confirm:
-                    st.error("Passwords do not match!")
-                else:
-                    success, msg, user_dict = auth_db.register_user(reg_name, reg_email, reg_password)
-                    if success:
-                        st.session_state.user = user_dict
-                        supabase_db.sync_user_to_supabase(user_dict)
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-
-    st.divider()
-    st.markdown("### 🌟 Key Capabilities")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("<div class='dv-card'><h4>📊 Student Marks Visualizer</h4>Grade distributions, radar graphs, 3D scatter plots for exam scores.</div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown("<div class='dv-card'><h4>⚔️ Head-to-Head Comparison</h4>Compare any two students side-by-side with radar charts and leader scorecards.</div>", unsafe_allow_html=True)
-    with c3:
-        st.markdown("<div class='dv-card'><h4>🏆 Leaderboard & Grade Analytics</h4>Automatic A+ to F grade calculations, class rank, and top scorer badges.</div>", unsafe_allow_html=True)
-
-    st.stop()
-
-
-# ============================================================
-# LOGGED IN PORTAL HEADER & NAVBAR
-# ============================================================
-
-u = st.session_state.user or {
-    "id": 0,
-    "name": "Guest",
-    "email": "guest@example.com",
-    "turns_remaining": 0,
-    "total_analyses": 0,
-    "is_paid_tier": 0,
-    "role": "user"
-}
-turns = u.get('turns_remaining', 0)
-is_paid = u.get('is_paid_tier', 0)
-
-col_h1, col_h2 = st.columns([3, 1])
-with col_h1:
-    st.title('DATAVIS v5 ULTIMATE 📊')
-    st.markdown(
-        f"<span style='color:#18C6C6; font-size:14px; font-weight:600;'>"
-        f"👋 Welcome <b>{u['name']}</b> ({u['email']}) · <i>Created by Arun a.k.a Arun</i></span>",
-        unsafe_allow_html=True
-    )
-with col_h2:
-    if turns <= 0:
-        st.error("🚨 **0 Analyses Left** (Top up ₹20)")
-
+st.title('DATAVIS v5 ULTIMATE 📊')
+st.markdown(
+    "<span class='dv-byline'>🥷 Coded by <b>Arun</b> · a.k.a <b>KIRITO_SERFORT</b></span>",
+    unsafe_allow_html=True
+)
 st.caption(
-    'Data analysis & visualization suite for student marks, academic performance, and office datasets.'
+    'Data analysis & visualization suite for students, academic work, and office use.\n\n'
+    'PDF table extraction · multi-file compatibility checking · data cleaning · auto insights · '
+    'Excel report export · fully customizable charts for large-scale, multi-dataset analysis. '
+    'See the **ℹ️ About** tab for full details.'
 )
 st.divider()
 
-
 # ============================================================
-# SIDEBAR: DATA UPLOAD & SETTINGS
+# SIDEBAR: DATA + SETTINGS
 # ============================================================
 
 with st.sidebar:
-    st.header('📂 Data Upload')
-
-    if st.button("🧪 Load Sample Student Marks Dataset", help="Load a pre-made student mark sheet to test all features instantly!"):
-        st.session_state.sample_data_loaded = True
-        st.toast("Loaded sample student marks dataset!", icon="✅")
-
+    st.header('📂 Data')
     file_types = ["csv", "xlsx", "xls"] + (["pdf"] if PDF_SUPPORT else [])
     uploaded_files = st.file_uploader(
-        "Upload your dataset (CSV / Excel"
-        + (" / PDF" if PDF_SUPPORT else "")
-        + ")",
+        "Upload one or more files (CSV / Excel"
+        + (" / PDF with tables" if PDF_SUPPORT else "")
+        + "). Multiple files enable growth & compatibility tools.",
         type=file_types,
         accept_multiple_files=True
     )
+    if not PDF_SUPPORT:
+        st.caption("⚠️ PDF support unavailable — install `pdfplumber` to enable it.")
 
     st.header("📈 Growth Projection Settings")
     pv = st.number_input('Present value or score', min_value=0.0, value=1000.0, step=100.0)
@@ -806,176 +676,25 @@ with st.sidebar:
     st.header('🤖 AI Summary')
     api_key = st.text_input('Enter your Claude API key', type='password')
 
-
 # ============================================================
-# TURN & FILE UPLOAD LIMITS GUARD (HIDDEN LIMITS UNTIL EXHAUSTED)
+# LOAD ALL FILES (flatten: PDFs can yield multiple tables per file)
 # ============================================================
 
-named_dfs = []
-
-if st.session_state.sample_data_loaded and not uploaded_files:
-    named_dfs = [("Sample_Student_Marks.csv", generate_sample_marks_data())]
-
-if uploaded_files:
-    n_uploaded = len(uploaded_files)
-
-    # 1. FILE UPLOAD LIMIT CHECKS
-    if not is_paid and n_uploaded > 3:
-        st.error(f"🚨 **Upload Limit Exceeded (Free Tier)**")
-        st.warning(
-            f"Free Tier allows a maximum of **3 file uploads per analysis**. You uploaded **{n_uploaded} files**.\n\n"
-            "Please remove the extra files or upgrade to Paid Tier (**₹20 for 2 analyses**) to upload up to 6 files per analysis!"
-        )
-        uploaded_files = None
-    elif is_paid and n_uploaded > 6:
-        extra_files = n_uploaded - 6
-        extra_fee = extra_files * 5.0
-        st.info(
-            f"ℹ️ **Multi-File Upload Notice**: You uploaded **{n_uploaded} files** ({extra_files} extra files beyond the 6 included).\n"
-            f"Extra file upload charge: **₹{extra_fee:.0f}** (₹5 per extra file beyond 6)."
-        )
-
-if uploaded_files:
-    session_signature = hashlib.md5("".join([f.name + str(f.size) for f in uploaded_files]).encode()).hexdigest()
-
-    # Check remaining analysis turns balance
-    if st.session_state.charged_session_id != session_signature:
-        if turns <= 0:
-            st.error("🚨 **Free Analysis Limit Exhausted!**")
-            st.warning(
-                "You have completed your **3 free dataset analyses**!\n\n"
-                "To continue analyzing datasets, comparing student marks, and exporting reports, "
-                "please top up your account balance (**₹20 for 2 analyses** via GPay / UPI)."
-            )
-            st.info("💡 Go to the **💳 Account & Billing** tab at the top to complete GPay UPI payment.")
-            uploaded_files = None
-        else:
-            dataset_names = ", ".join([f.name for f in uploaded_files])
-            extra_fee = max(0, (len(uploaded_files) - 6) * 5.0) if is_paid else 0.0
-            success, remaining, msg = auth_db.consume_turn(
-                u['id'], "Data Analysis & Visualization", dataset_names, len(uploaded_files), extra_fee
-            )
-            if success:
-                st.session_state.charged_session_id = session_signature
-                st.session_state.user['turns_remaining'] = remaining
-                turns = remaining
-
+named_dfs = []          # list of (label, dataframe)
 if uploaded_files:
     for f in uploaded_files:
         named_dfs.extend(load_file(f))
-
 
 # ============================================================
 # MAIN BODY: TABS
 # ============================================================
 
-(tab_dash, tab_grades, tab_charts, tab_stats, tab_personal, tab_compare, tab_growth,
- tab_raw, tab_clean, tab_proj, tab_export, tab_ai, tab_account, tab_about) = st.tabs(
-    ["🏠 Dashboard", "🏆 Leaderboard & Grades", "📊 Explore & Customize", "🧮 Stats & Correlation",
-     "🎯 Personal Analysis", "⚔️ Head-to-Head", "📅 Multi-File Growth", "📁 Raw Data",
-     "🧹 Data Cleaning", "🔮 Projection", "📤 Export Report", "🤖 AI Insights", "💳 Account & Billing", "ℹ️ About"]
+(tab_dash, tab_charts, tab_stats, tab_personal, tab_compare, tab_growth,
+ tab_raw, tab_clean, tab_proj, tab_export, tab_ai, tab_about) = st.tabs(
+    ["🏠 Dashboard", "📊 Explore & Customize", "🧮 Stats & Correlation", "🎯 Personal Analysis",
+     "⚔️ Head-to-Head", "📅 Multi-File Growth", "📁 Raw Data", "🧹 Data Cleaning",
+     "🔮 Projection", "📤 Export Report", "🤖 AI Insights", "ℹ️ About"]
 )
-
-
-# -------------------- TAB: ACCOUNT & BILLING (GPAY / UPI ₹) --------------------
-with tab_account:
-    st.subheader("💳 Account & Billing (GPay / UPI Payment)")
-
-    u_fresh = auth_db.get_user_by_id(u['id'])
-    if u_fresh:
-        st.session_state.user = u_fresh
-        u = u_fresh
-
-    ac1, ac2, ac3 = st.columns(3)
-    ac1.markdown(f"<div class='dv-kpi'><div class='dv-kpi-label'>User Profile</div><div class='dv-kpi-value' style='font-size:18px;'>{u['name']}</div><small>{u['email']}</small></div>", unsafe_allow_html=True)
-    ac2.markdown(f"<div class='dv-kpi'><div class='dv-kpi-label'>Analyses Balance</div><div class='dv-kpi-value'>⚡ {u['turns_remaining']} Left</div><small>{'Paid Tier (6 Uploads)' if u.get('is_paid_tier') else 'Free Tier (3 Uploads)'}</small></div>", unsafe_allow_html=True)
-    ac3.markdown(f"<div class='dv-kpi'><div class='dv-kpi-label'>Total Executed</div><div class='dv-kpi-value'>📊 {u['total_analyses']}</div></div>", unsafe_allow_html=True)
-
-    st.divider()
-
-    st.markdown("### 📱 Top Up Analysis Balance (GPay / PhonePe / UPI)")
-    st.caption("Pay easily using GPay, PhonePe, Paytm, or any UPI app.")
-
-    p1, p2, p3 = st.columns(3)
-    turns_to_buy = 0
-    amount_inr = 0.0
-
-    with p1:
-        st.markdown("<div class='dv-card'><h4>⚡ 2 Analyses</h4><h2 style='color:#18C6C6;'>₹20</h2><p>Includes up to 6 file uploads per analysis.</p></div>", unsafe_allow_html=True)
-        if st.button("Buy 2 Analyses (₹20)", key="buy_2"):
-            turns_to_buy = 2
-            amount_inr = 20.0
-
-    with p2:
-        st.markdown("<div class='dv-card'><h4>⚡ 5 Analyses</h4><h2 style='color:#7C4DFF;'>₹50</h2><p>Popular pack for semester records.</p></div>", unsafe_allow_html=True)
-        if st.button("Buy 5 Analyses (₹50)", key="buy_5"):
-            turns_to_buy = 5
-            amount_inr = 50.0
-
-    with p3:
-        st.markdown("<div class='dv-card'><h4>⚡ 12 Analyses</h4><h2 style='color:#FF6EC7;'>₹100</h2><p>Best value pack for academic work.</p></div>", unsafe_allow_html=True)
-        if st.button("Buy 12 Analyses (₹100)", key="buy_12"):
-            turns_to_buy = 12
-            amount_inr = 100.0
-
-    if turns_to_buy > 0:
-        st.markdown("---")
-        st.subheader(f"GPay / UPI Payment: ₹{amount_inr:.0f} for {turns_to_buy} Analyses")
-
-        pay_c1, pay_c2 = st.columns([1, 1])
-
-        with pay_c1:
-            st.markdown(f"""
-            <div class='dv-card'>
-                <h4>📲 How to Pay via GPay / UPI:</h4>
-                <ol>
-                    <li>Open <b>Google Pay</b>, <b>PhonePe</b>, <b>Paytm</b>, or any UPI App.</li>
-                    <li>Pay <b>₹{amount_inr:.0f}</b> to UPI ID: <b style='color:#18C6C6; font-size:18px;'>{UPI_ID}</b></li>
-                    <li>Copy the <b>12-digit UPI Ref No / UTR</b> from your GPay payment receipt.</li>
-                    <li>Enter the UTR number on the right to activate your turns instantly!</li>
-                </ol>
-            </div>
-            """, unsafe_allow_html=True)
-
-        with pay_c2:
-            st.markdown("#### 🔑 Confirm Payment & Enter UTR Number")
-            with st.form("upi_confirm_form"):
-                utr_num = st.text_input("Enter 12-digit UTR / UPI Ref Number", placeholder="e.g. 427891023456")
-                submit_pay = st.form_submit_button("Verify & Credit Analyses", type="primary")
-
-                if submit_pay:
-                    if not utr_num or len(utr_num.strip()) < 4:
-                        st.error("Please enter a valid UPI UTR / Reference number.")
-                    else:
-                        success, new_bal, msg = auth_db.add_credits_upi(u['id'], turns_to_buy, amount_inr, utr_num.strip())
-                        if success:
-                            st.success(msg)
-                            st.session_state.user['turns_remaining'] = new_bal
-                            st.session_state.user['is_paid_tier'] = 1
-                            supabase_db.sync_user_to_supabase(st.session_state.user)
-                            st.rerun()
-                        else:
-                            st.error(msg)
-
-    st.divider()
-
-    st.markdown("### 📋 Activity & Payment History")
-    analyses_history, txn_history = auth_db.get_user_history(u['id'])
-
-    h_tab1, h_tab2 = st.tabs(["📊 Analysis History", "💳 UPI Payment Transactions"])
-
-    with h_tab1:
-        if analyses_history:
-            st.dataframe(pd.DataFrame(analyses_history), width='stretch')
-        else:
-            st.info("No analyses run yet.")
-
-    with h_tab2:
-        if txn_history:
-            st.dataframe(pd.DataFrame(txn_history), width='stretch')
-        else:
-            st.info("No payment transactions recorded yet.")
-
 
 # -------------------- TAB: ABOUT (data-independent) --------------------
 with tab_about:
@@ -983,9 +702,12 @@ with tab_about:
         """
         <div class='dv-about-hero'>
             <h2>DATAVIS v5 ULTIMATE 📊</h2>
-            <p>Coded by <span style='color:#18C6C6; font-weight:700;'>Arun a.k.a Arun</span></p>
-            <p style='margin-top:10px;'>A complete data analysis & student performance visualization portal
-            with User Authentication, GPay / UPI payments, and Supabase integration.</p>
+            <p>Coded by <span class='handle'>Arun</span> — online handle
+            <span class='handle'>KIRITO_SERFORT</span></p>
+            <p style='margin-top:10px;'>A one-file Streamlit data analysis & visualization suite built
+            for students, academic project work, and everyday office reporting — upload a spreadsheet
+            or PDF and get charts, statistics, cleaning tools, and an exportable report without writing
+            any code.</p>
         </div>
         """,
         unsafe_allow_html=True
@@ -993,29 +715,56 @@ with tab_about:
 
     col_a, col_b = st.columns(2)
     with col_a:
-        st.markdown("#### 👤 Creator Information")
+        st.markdown("#### 👤 Creator")
         st.markdown(
             "<div class='dv-card'>"
             "<b>Name:</b> Arun<br>"
-            "<b>Credit:</b> Created by Arun a.k.a Arun<br>"
-            "<b>Project:</b> DATAVIS — data visualization suite<br>"
-            "<b>Built with:</b> Python · Streamlit · SQLite / Supabase · Plotly · Pandas"
+            "<b>Online handle:</b> KIRITO_SERFORT<br>"
+            "<b>Project:</b> DATAVIS — personal data visualization suite<br>"
+            "<b>Built with:</b> Python · Streamlit · Plotly · Pandas"
+            "</div>",
+            unsafe_allow_html=True
+        )
+        st.markdown("#### 🕓 Version History")
+        st.markdown(
+            "<div class='dv-card'>"
+            "<b>v5 ULTIMATE</b> — About tab, refreshed UI styling, rebrand<br>"
+            "<b>v3 ULTIMATE</b> — Dashboard, Data Cleaning, Export Report, searchable raw data, "
+            "theme presets<br>"
+            "<b>v2.5</b> — PDF table extraction, multi-file compatibility checking, customizable charts"
             "</div>",
             unsafe_allow_html=True
         )
 
     with col_b:
-        st.markdown("#### 💳 Pricing & Limits")
+        st.markdown("#### 🧩 What it's for")
         st.markdown(
-            "<div class='dv-card'>"
-            "<b>Free Tier:</b> 3 Free Analyses (Max 3 files per upload)<br>"
-            "<b>Paid Tier (₹20 for 2 turns):</b> Max 6 files per upload<br>"
-            "<b>Extra Uploads:</b> ₹5 per extra file beyond 6<br>"
-            "<b>Payment Method:</b> GPay / PhonePe / Paytm / Any UPI ID"
-            "</div>",
+            "<div class='dv-card'>Built to take the busywork out of turning raw spreadsheets or "
+            "scanned/PDF tables into readable charts and summaries — for coursework, lab reports, "
+            "society/club records, small office datasets, or comparing performance across terms and "
+            "semesters, without needing Excel formulas or a separate BI tool.</div>",
             unsafe_allow_html=True
         )
+        st.markdown("#### ✨ Feature Highlights")
+        for feat in [
+            "📁 CSV / Excel / PDF table upload, single or multi-file",
+            "🔗 Multi-file column compatibility check",
+            "📊 9 chart types + radar + 3D scatter",
+            "🧮 Correlation heatmap & distribution explorer",
+            "🎯 Personal & Head-to-Head comparisons",
+            "📅 Multi-file growth tracking",
+            "🧹 Cleaning tools + IQR outlier detection",
+            "📤 One-click multi-sheet Excel report",
+            "🤖 Optional AI-powered insights",
+            "🎨 5 theme presets + dark/light + compact mode",
+        ]:
+            st.markdown(f"<span class='dv-feature-pill'>{feat}</span>", unsafe_allow_html=True)
 
+    st.divider()
+    st.caption(
+        "DATAVIS is an independent personal project and is not affiliated with any institution. "
+        "Feedback and feature requests are welcome — this suite is actively evolving version to version."
+    )
 
 # -------------------- TAB: PROJECTION (data-independent) --------------------
 with tab_proj:
@@ -1025,22 +774,20 @@ with tab_proj:
     projection_df = pd.DataFrame({'Period': years, 'Projected Value': proj_values})
     c1, c2 = st.columns([1, 2])
     with c1:
-        st.dataframe(projection_df, width='stretch', height=420)
+        st.dataframe(projection_df, use_container_width=True, height=420)
     with c2:
         fig_growth = px.line(projection_df, x='Period', y='Projected Value', markers=True,
                               title=f"Projection at {rate*100:.1f}% per Period",
                               color_discrete_sequence=COLOR_SEQUENCE)
         fig_growth = apply_plotly_theme(fig_growth, dark_mode)
-        st.plotly_chart(fig_growth, width='stretch')
+        st.plotly_chart(fig_growth, use_container_width=True)
 
-
-# -------------------- ANALYSIS TABS (FOR LOADED DATASETS) --------------------
 if named_dfs:
     labels = [lbl for lbl, _ in named_dfs]
     with st.sidebar:
         st.header('🗂️ Active Dataset')
         primary_label = st.selectbox(
-            "Dataset to use for single-file tools",
+            "Dataset to use for single-file tools (Explore, Stats, Personal, Head-to-Head)",
             labels, index=0
         )
     df = dict(named_dfs)[primary_label].copy()
@@ -1055,6 +802,7 @@ if named_dfs:
             fc = pd.to_numeric(df[filter_col], errors="coerce")
             min_val, max_val = float(fc.min()), float(fc.max())
             if min_val == max_val:
+                st.caption(f"All rows share the same {filter_col} value ({min_val}) — nothing to filter.")
                 selected_range = (min_val, max_val)
             else:
                 selected_range = st.slider(f"Range for {filter_col}", min_val, max_val, (min_val, max_val))
@@ -1069,19 +817,16 @@ if named_dfs:
 
     use_stacked_layout = len(df) > LARGE_DATASET_THRESHOLD
 
-    # Compute grades if metrics exist
-    graded_df = compute_student_grades(df, numeric_cols, non_numeric_cols[0] if non_numeric_cols else None)
-
-    # -------------------- TAB: DASHBOARD --------------------
+    # -------------------- TAB: DASHBOARD (overview + KPIs + auto insights) --------------------
     with tab_dash:
         st.subheader(f"Overview: {primary_label}")
 
         k1, k2, k3, k4 = st.columns(4)
         kpi_defs = [
-            ("Rows / Students", f"{len(df):,}"),
+            ("Rows", f"{len(df):,}"),
             ("Columns", f"{len(df.columns)}"),
-            ("Numeric Metrics", f"{len(numeric_cols)}"),
-            ("Missing Cells", f"{int(df.isna().sum().sum()):,}"),
+            ("Numeric metrics", f"{len(numeric_cols)}"),
+            ("Missing cells", f"{int(df.isna().sum().sum()):,}"),
         ]
         for col, (label, value) in zip([k1, k2, k3, k4], kpi_defs):
             col.markdown(
@@ -1090,24 +835,10 @@ if named_dfs:
                 unsafe_allow_html=True
             )
 
-        if "Grade" in graded_df.columns:
-            st.markdown("")
-            st.markdown("#### 🏆 Performance Highlights")
-            g1, g2, g3 = st.columns(3)
-
-            top_row = graded_df.iloc[0]
-            name_col_val = non_numeric_cols[0] if non_numeric_cols else "Student"
-            top_name = top_row[name_col_val] if name_col_val in top_row else "Top Performer"
-
-            pass_count = (graded_df["Average %"] >= 50).sum()
-            pass_rate = round((pass_count / len(graded_df)) * 100, 1)
-
-            g1.markdown(f"<div class='dv-kpi'><div class='dv-kpi-label'>👑 Top Rank 1</div><div class='dv-kpi-value' style='font-size:20px; color:#38f5b0;'>{top_name}</div><small>Avg: {top_row['Average %']}%</small></div>", unsafe_allow_html=True)
-            g2.markdown(f"<div class='dv-kpi'><div class='dv-kpi-label'>📈 Class Pass Rate</div><div class='dv-kpi-value'>{pass_rate}%</div><small>{pass_count}/{len(graded_df)} Students Passed</small></div>", unsafe_allow_html=True)
-            g3.markdown(f"<div class='dv-kpi'><div class='dv-kpi-label'>📊 Class Average</div><div class='dv-kpi-value'>{graded_df['Average %'].mean():.1f}%</div><small>Overall Subjects</small></div>", unsafe_allow_html=True)
-
         st.markdown("")
         st.markdown("#### 🧠 Auto Insights")
+        st.caption("Generated instantly from the data itself — no API key needed. "
+                   "For deeper narrative analysis, see the AI Insights tab.")
         insight_name_col = non_numeric_cols[0] if non_numeric_cols else None
         for bullet in auto_insights(df, numeric_cols, insight_name_col):
             st.markdown(f"<div class='dv-insight'>💡 {bullet}</div>", unsafe_allow_html=True)
@@ -1115,12 +846,13 @@ if named_dfs:
         if len(named_dfs) > 1:
             st.markdown("")
             st.markdown("#### 🗂️ Files Loaded")
-            tag_html = "".join(f"<span class='dv-tag'>{lbl} · {len(tdf)}×{len(tdf.columns)}</span>" for lbl, tdf in named_dfs)
+            tag_html = "".join(f"<span class='dv-tag'>{lbl} · {len(tdf)}×{len(tdf.columns)}</span>"
+                                for lbl, tdf in named_dfs)
             st.markdown(tag_html, unsafe_allow_html=True)
 
         if numeric_cols:
             st.markdown("")
-            st.markdown("#### ⚡ Quick Chart Preview")
+            st.markdown("#### ⚡ Quick Chart")
             quick_metric = st.selectbox("Metric to preview", numeric_cols, key="dash_quick_metric")
             quick_label_col = non_numeric_cols[0] if non_numeric_cols else None
             if quick_label_col:
@@ -1131,107 +863,13 @@ if named_dfs:
                                           title=f"Distribution of {quick_metric}")
             fig_quick = apply_plotly_theme(fig_quick, dark_mode)
             fig_quick.update_layout(height=380)
-            st.plotly_chart(fig_quick, width='stretch')
+            st.plotly_chart(fig_quick, use_container_width=True)
 
-    # -------------------- TAB: LEADERBOARD & GRADES --------------------
-    with tab_grades:
-        st.subheader(f"🏆 Class Leaderboard & Grade Analytics ({primary_label})")
-
-        if "Grade" in graded_df.columns:
-            name_col_lb = non_numeric_cols[0] if non_numeric_cols else None
-
-            # ── PODIUM: TOP 3 MEDALS ────────────────────────────────────────
-            sorted_lb = graded_df.sort_values("Class Rank").reset_index(drop=True)
-            medal_emojis = ["🥇", "🥈", "🥉"]
-            medal_css   = ["dv-medal-gold", "dv-medal-silver", "dv-medal-bronze"]
-
-            if len(sorted_lb) >= 3:
-                st.markdown("#### 🏅 Top 3 Podium")
-                pod1, pod2, pod3 = st.columns(3)
-                for podium_col, idx, medal_emoji, medal_class in zip(
-                    [pod1, pod2, pod3], [0, 1, 2], medal_emojis, medal_css
-                ):
-                    row = sorted_lb.iloc[idx]
-                    nm = str(row[name_col_lb]) if name_col_lb else f"Rank {idx+1}"
-                    avg = f"{row['Average %']:.1f}%"
-                    grade_raw = str(row["Grade"])
-                    grade_badge_map = {
-                        "A+": "dv-badge-aplus", "A ": "dv-badge-a", "B ": "dv-badge-b",
-                        "C ": "dv-badge-c", "D ": "dv-badge-d", "F ": "dv-badge-f"
-                    }
-                    badge_cls = next((v for k, v in grade_badge_map.items() if grade_raw.startswith(k.strip())), "dv-badge-b")
-                    podium_col.markdown(
-                        f"<div class='{medal_class}'>"
-                        f"<div style='font-size:36px;'>{medal_emoji}</div>"
-                        f"<div class='dv-medal-name'>{nm}</div>"
-                        f"<div class='dv-medal-score'>{avg}</div>"
-                        f"<span class='dv-badge {badge_cls}'>{grade_raw}</span>"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
-                st.markdown("")
-
-            # ── MAIN RANKINGS TABLE + GRADE CHART ──────────────────────────
-            col_l1, col_l2 = st.columns([2, 1])
-
-            with col_l1:
-                st.markdown("#### 📋 Full Class Rankings")
-                # Colour-code Grade column with badges
-                display_df = graded_df.copy()
-                st.dataframe(display_df, width='stretch', height=450)
-
-            with col_l2:
-                st.markdown("#### 🍰 Grade Distribution")
-                grade_counts = graded_df["Grade"].value_counts().reset_index()
-                grade_counts.columns = ["Grade", "Count"]
-                fig_grade_pie = px.pie(grade_counts, names="Grade", values="Count", title="Grade Share",
-                                       color_discrete_sequence=COLOR_SEQUENCE)
-                fig_grade_pie = apply_plotly_theme(fig_grade_pie, dark_mode)
-                st.plotly_chart(fig_grade_pie, width='stretch')
-
-            # ── SUBJECT TOPPERS ─────────────────────────────────────────────
-            metric_cols_lb = [c for c in numeric_cols if not _looks_like_identifier_column(graded_df, c)
-                               and c not in ("Total Marks", "Average %", "Class Rank")]
-            if metric_cols_lb and name_col_lb:
-                st.markdown("#### 🌟 Subject-Wise Toppers")
-                topper_cols = st.columns(min(3, len(metric_cols_lb)))
-                for i, subj in enumerate(metric_cols_lb):
-                    top_idx = graded_df[subj].idxmax()
-                    top_row = graded_df.loc[top_idx]
-                    top_name_val = str(top_row[name_col_lb])
-                    top_score = top_row[subj]
-                    col_ix = i % 3
-                    topper_cols[col_ix].markdown(
-                        f"<div class='dv-subject-topper'>"
-                        f"<div><b style='color:{accent2};'>{subj}</b><br>"
-                        f"<span style='font-size:15px; font-weight:700;'>{top_name_val}</span></div>"
-                        f"<div style='text-align:right;'><span style='font-size:22px; font-weight:800;'>{top_score}</span><br>"
-                        f"<small style='color:{muted};'>Top Score</small></div>"
-                        f"</div>",
-                        unsafe_allow_html=True
-                    )
-
-            # ── GRADE DISTRIBUTION BAR ──────────────────────────────────────
-            st.markdown("#### 📊 Grade Band Bar Chart")
-            grade_order = ["A+ (Outstanding)", "A (Excellent)", "B (Good)", "C (Average)", "D (Pass)", "F (Fail)"]
-            grade_bar_df = graded_df["Grade"].value_counts().reindex(grade_order).dropna().reset_index()
-            grade_bar_df.columns = ["Grade", "Count"]
-            fig_grade_bar = px.bar(
-                grade_bar_df, x="Grade", y="Count",
-                color="Grade", color_discrete_sequence=COLOR_SEQUENCE,
-                title="Students per Grade Band", text="Count"
-            )
-            fig_grade_bar.update_traces(textposition="outside")
-            fig_grade_bar = apply_plotly_theme(fig_grade_bar, dark_mode)
-            st.plotly_chart(fig_grade_bar, width='stretch')
-
-        else:
-            st.info("No numeric metric columns detected to calculate grades.")
-
-    # -------------------- TAB: RAW DATA --------------------
+    # -------------------- TAB: RAW DATA (per file, readable, labeled, searchable) --------------------
     with tab_raw:
         st.subheader("Raw Data by File")
-        raw_search = st.text_input("🔎 Search across all files", key="raw_search")
+        st.caption("Each uploaded file (or PDF table) is shown separately below, labeled by source.")
+        raw_search = st.text_input("🔎 Search across all files (filters every table below)", key="raw_search")
         for label, tdf in named_dfs:
             shown_df = global_search(tdf, raw_search)
             match_note = "" if not raw_search else f"  ·  {len(shown_df)} match(es)"
@@ -1240,7 +878,7 @@ if named_dfs:
                 if raw_search and shown_df.empty:
                     st.caption("No matches in this file.")
                 else:
-                    st.dataframe(shown_df, width='stretch',
+                    st.dataframe(shown_df, use_container_width=True,
                                  height=min(420, 60 + 35 * min(len(shown_df), 10)))
                     st.download_button(
                         f"⬇️ Download this table (CSV)",
@@ -1253,6 +891,9 @@ if named_dfs:
     # -------------------- TAB: EXPLORE & CUSTOMIZE --------------------
     with tab_charts:
         st.subheader(f"Exploring: {primary_label}  ({len(df)} rows)")
+        if use_stacked_layout:
+            st.info(f"📊 {len(df)} rows detected — using a full-width layout and taller charts for readability.")
+
         st.markdown("#### 🛠️ Chart Builder")
         cc1, cc2, cc3, cc4 = st.columns(4)
         with cc1:
@@ -1278,16 +919,20 @@ if named_dfs:
             df, chart_type, x_col, y_col, color_col, COLOR_SEQUENCE, CONT_SCALE,
             horizontal, sort_desc, dark_mode, title=f"{y_col} by {x_col}", height=custom_height
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
         st.download_button("⬇️ Download this chart (HTML)", fig.to_html(), file_name="chart.html", mime="text/html")
 
         st.divider()
 
-        # Radar Chart
+        # ---------- RADAR CHART ----------
         st.subheader('Radar (Hex) Chart — compare rows across metrics')
         rc1, rc2 = st.columns([1, 2])
         with rc1:
-            label_col = non_numeric_cols[0] if non_numeric_cols else None
+            if non_numeric_cols:
+                label_col = st.selectbox("Row label column", non_numeric_cols, key="radar_label_col")
+            else:
+                label_col = None
+                st.info("No text column found for labels — rows will be labeled by number instead.")
             radar_cols = st.multiselect(
                 "Metrics to compare (spokes)", numeric_cols,
                 default=numeric_cols[:5] if len(numeric_cols) >= 5 else numeric_cols
@@ -1300,12 +945,17 @@ if named_dfs:
                 fig_radar = build_radar_figure(df, radar_cols, row_indices, label_col, COLOR_SEQUENCE)
                 fig_radar.update_layout(height=520)
                 fig_radar = apply_plotly_theme(fig_radar, dark_mode)
-                st.plotly_chart(fig_radar, width='stretch')
+                st.plotly_chart(fig_radar, use_container_width=True)
+            else:
+                st.info("Select at least one metric and one row to see the radar chart.")
 
         st.divider()
 
-        # 3D Explorer
+        # ---------- 3D SCATTER EXPLORER ----------
         st.subheader("3D Explorer")
+        st.caption("Plot every row in 3D space across three metrics at once — reveals clusters "
+                   "and outliers that 2D charts can hide. Great for large-scale, multi-metric datasets.")
+
         if len(numeric_cols) >= 3:
             c1, c2, c3, c4 = st.columns(4)
             with c1:
@@ -1317,33 +967,59 @@ if named_dfs:
             with c4:
                 color3d = st.selectbox("Color by", ["(none)"] + df.columns.tolist(), key="color3d")
 
+            hover_name = label_col if 'label_col' in dir() and label_col else None
+            is_num_color = color3d != "(none)" and pd.api.types.is_numeric_dtype(df[color3d])
             fig_3d = px.scatter_3d(
                 df, x=x3d, y=y3d, z=z3d,
                 color=None if color3d == "(none)" else color3d,
+                hover_name=hover_name,
                 title=f"{x3d} vs {y3d} vs {z3d}",
                 opacity=0.85,
-                color_continuous_scale=CONT_SCALE if color3d != "(none)" and pd.api.types.is_numeric_dtype(df[color3d]) else None,
-                color_discrete_sequence=COLOR_SEQUENCE if color3d == "(none)" or not pd.api.types.is_numeric_dtype(df[color3d]) else None,
+                color_continuous_scale=CONT_SCALE if is_num_color else None,
+                color_discrete_sequence=COLOR_SEQUENCE if not is_num_color else None,
             )
+            fig_3d.update_traces(marker=dict(size=6, line=dict(width=0.5, color='white')))
             fig_3d.update_layout(scene=dict(xaxis_title=x3d, yaxis_title=y3d, zaxis_title=z3d), height=650)
             fig_3d = apply_plotly_theme(fig_3d, dark_mode)
-            st.plotly_chart(fig_3d, width='stretch')
+            st.plotly_chart(fig_3d, use_container_width=True)
+        else:
+            st.info("Need at least 3 numeric columns for the 3D explorer.")
 
     # -------------------- TAB: STATS & CORRELATION --------------------
     with tab_stats:
-        st.subheader(f"Statistical Summary & Subject Weakness Analysis: {primary_label}")
+        st.subheader(f"Statistical Summary: {primary_label}")
         if numeric_cols:
-            st.dataframe(df[numeric_cols].describe().T, width='stretch')
+            st.dataframe(df[numeric_cols].describe().T, use_container_width=True)
+        else:
+            st.info("No numeric columns to summarize.")
+
+        st.markdown("#### Missing Values")
+        missing = df.isna().sum()
+        missing = missing[missing > 0]
+        if missing.empty:
+            st.success("No missing values detected in this dataset.")
+        else:
+            fig_missing = px.bar(
+                x=missing.index, y=missing.values, title="Missing Values per Column",
+                labels={"x": "Column", "y": "Missing Count"}, color_discrete_sequence=COLOR_SEQUENCE
+            )
+            fig_missing = apply_plotly_theme(fig_missing, dark_mode)
+            st.plotly_chart(fig_missing, use_container_width=True)
 
         st.markdown("#### Correlation Heatmap")
+        st.caption("Shows how strongly numeric columns move together — useful for spotting redundant "
+                   "metrics or hidden relationships across large datasets.")
         if len(numeric_cols) >= 2:
             corr = df[numeric_cols].corr(numeric_only=True)
             fig_corr = px.imshow(
                 corr, text_auto=".2f", aspect="auto",
                 color_continuous_scale=CONT_SCALE, title="Correlation Matrix"
             )
+            fig_corr.update_layout(height=max(420, 40 * len(numeric_cols)))
             fig_corr = apply_plotly_theme(fig_corr, dark_mode)
-            st.plotly_chart(fig_corr, width='stretch')
+            st.plotly_chart(fig_corr, use_container_width=True)
+        else:
+            st.info("Need at least 2 numeric columns for a correlation heatmap.")
 
         st.markdown("#### Distribution Explorer")
         if numeric_cols:
@@ -1353,21 +1029,27 @@ if named_dfs:
                 color_discrete_sequence=COLOR_SEQUENCE
             )
             fig_dist = apply_plotly_theme(fig_dist, dark_mode)
-            st.plotly_chart(fig_dist, width='stretch')
+            st.plotly_chart(fig_dist, use_container_width=True)
 
     # -------------------- TAB: PERSONAL ANALYSIS --------------------
     with tab_personal:
-        st.subheader("Personal Analysis (Student Score Breakdown)")
+        st.subheader("Personal Analysis")
+
         if non_numeric_cols:
-            name_col = st.selectbox("Which column holds names/entities?", non_numeric_cols, key="personal_name_col")
-            search_name = st.text_input("Enter a student name to analyze", key="personal_search")
+            name_col = st.selectbox("Which column holds names?", non_numeric_cols, key="personal_name_col")
+            search_name = st.text_input("Enter a name to analyze", key="personal_search")
         else:
             name_col, search_name = None, None
+            st.info("No text column found to identify entities by name.")
 
         if name_col and search_name:
             student_row, match_count = find_student_row(df, name_col, search_name)
-            if student_row is not None:
-                st.success(f"Found: {student_row[name_col]}")
+
+            if student_row is None:
+                st.warning(f"No entry named '{search_name}' found in this data.")
+            else:
+                st.success(f"Found: {student_row[name_col]}" + (f"  ·  {match_count} matching rows" if match_count > 1 else ""))
+
                 comparison_rows = []
                 for subject in numeric_cols:
                     score = student_row[subject]
@@ -1379,8 +1061,9 @@ if named_dfs:
                         "Avg of Those Above": round(higher[subject].mean(), 2) if not higher.empty else None,
                         "Gap to Topper": round(df[subject].max() - score, 2)
                     })
+
                 comparison_df = pd.DataFrame(comparison_rows)
-                st.dataframe(comparison_df, width='stretch')
+                st.dataframe(comparison_df, use_container_width=True)
 
                 chart_data = comparison_df.melt(
                     id_vars="Subject", value_vars=["Score", "Avg of Those Above"],
@@ -1388,29 +1071,41 @@ if named_dfs:
                 )
                 fig_personal = px.bar(
                     chart_data, x="Subject", y="Value", color="Metric", barmode="group",
-                    title=f"{student_row[name_col]}'s Scores vs. Avg of Higher Performers",
+                    title=f"{student_row[name_col]}'s Scores vs. Those Above Them",
                     color_discrete_sequence=COLOR_SEQUENCE
                 )
                 fig_personal = apply_plotly_theme(fig_personal, dark_mode)
-                st.plotly_chart(fig_personal, width='stretch')
+                st.plotly_chart(fig_personal, use_container_width=True)
 
-    # -------------------- TAB: HEAD-TO-HEAD COMPARISON --------------------
+    # -------------------- TAB: HEAD-TO-HEAD --------------------
     with tab_compare:
         st.subheader("Head-to-Head Comparison")
+
         if non_numeric_cols:
             vs_name_col = st.selectbox("Name column", non_numeric_cols, key="vs_name_col")
             entity_options = df[vs_name_col].astype(str).tolist()
 
             colA, colB = st.columns(2)
             with colA:
-                person_a = st.selectbox("First Student / Entity", entity_options, key="vs_a")
+                person_a = st.selectbox("First entity", entity_options, key="vs_a")
             with colB:
-                default_b = 1 if len(entity_options) > 1 else 0
-                person_b = st.selectbox("Second Student / Entity", entity_options, index=default_b, key="vs_b")
+                default_b_index = 1 if len(entity_options) > 1 else 0
+                person_b = st.selectbox("Second entity", entity_options, index=default_b_index, key="vs_b")
 
             if person_a and person_b and person_a != person_b:
-                row_a, _ = find_student_row(df, vs_name_col, person_a)
-                row_b, _ = find_student_row(df, vs_name_col, person_b)
+                row_a, count_a = find_student_row(df, vs_name_col, person_a)
+                row_b, count_b = find_student_row(df, vs_name_col, person_b)
+
+                if count_a > 1:
+                    st.warning(
+                        f"⚠️ **{count_a} rows** match the name '{person_a}' — showing the first one found. "
+                        "If there are two different people with this name, double-check which row is intended."
+                    )
+                if count_b > 1:
+                    st.warning(
+                        f"⚠️ **{count_b} rows** match the name '{person_b}' — showing the first one found. "
+                        "If there are two different people with this name, double-check which row is intended."
+                    )
 
                 vs_cols = st.multiselect(
                     "Metrics to compare", numeric_cols,
@@ -1431,7 +1126,7 @@ if named_dfs:
                     fig_vs.update_layout(polar=dict(radialaxis=dict(visible=True)), showlegend=True,
                                           title=f"{person_a} vs {person_b}")
                     fig_vs = apply_plotly_theme(fig_vs, dark_mode)
-                    st.plotly_chart(fig_vs, width='stretch')
+                    st.plotly_chart(fig_vs, use_container_width=True)
 
                     diff_rows = []
                     for subject in vs_cols:
@@ -1444,24 +1139,49 @@ if named_dfs:
                             "Leader": person_a if a_score > b_score else (person_b if b_score > a_score else "Tie")
                         })
                     diff_df = pd.DataFrame(diff_rows)
-                    st.dataframe(diff_df, width='stretch')
+                    st.dataframe(diff_df, use_container_width=True)
+
+                    a_wins = (diff_df["Leader"] == person_a).sum()
+                    b_wins = (diff_df["Leader"] == person_b).sum()
+                    st.info(f"**{person_a}** leads in {a_wins} metric(s) · **{person_b}** leads in {b_wins} metric(s)")
+            else:
+                st.info("Pick two different entities to compare.")
+        else:
+            st.info("No text column found to identify entities by name.")
 
     # -------------------- TAB: MULTI-FILE GROWTH --------------------
     with tab_growth:
         if len(named_dfs) < 2:
-            st.info("Upload 2 or more files (or a multi-table PDF) to track multi-file growth.")
+            st.info("Upload 2 or more files (or a multi-table PDF, e.g. one per semester) in the sidebar to unlock this section.")
         else:
             st.subheader("File Compatibility Check")
             compat = check_file_compatibility(named_dfs)
-            if compat["all_match"]:
-                st.success("✅ All files share identical columns.")
-                use_cols = compat["common_cols"]
-            else:
-                use_cols = st.multiselect(
-                    "Shared columns to use", compat["common_cols"], default=compat["common_cols"]
+
+            cols = st.columns(len(named_dfs)) if len(named_dfs) <= 4 else [st]
+            for i, r in enumerate(compat["report"]):
+                target = cols[i] if len(named_dfs) <= 4 else st
+                target.markdown(
+                    f"<div class='dv-card'><b>{r['file']}</b><br>{r['rows']} rows · {r['columns']} columns</div>",
+                    unsafe_allow_html=True
                 )
 
-            if use_cols:
+            if compat["all_match"]:
+                st.success("✅ All files share identical columns — they can be combined automatically.")
+                use_cols = compat["common_cols"]
+            else:
+                st.warning(
+                    "⚠️ These files don't share the exact same columns (different headers or column counts), "
+                    "so they can't be auto-combined. Pick the columns that are common and meaningful across "
+                    "all of them below."
+                )
+                use_cols = st.multiselect(
+                    "Columns to use for combined analysis (shared across every file)",
+                    compat["common_cols"], default=compat["common_cols"]
+                )
+
+            if not use_cols:
+                st.info("Select at least one shared column to continue.")
+            else:
                 semester_dfs = []
                 for i, (label, tdf) in enumerate(named_dfs):
                     sem_df = tdf[use_cols].copy()
@@ -1471,53 +1191,192 @@ if named_dfs:
                 combined_df = pd.concat(semester_dfs, ignore_index=True)
                 name_cols_multi = [c for c in combined_df.select_dtypes(exclude=np.number).columns if c != '__Semester__']
 
-                if name_cols_multi:
-                    name_col_multi = st.selectbox("Shared Name Column", name_cols_multi, key="multi_name_col")
+                if not name_cols_multi:
+                    st.info("No text column found among the shared columns to identify entities by name across files.")
+                else:
+                    st.divider()
+                    name_col_multi = st.selectbox(
+                        "Which shared column holds entity/student names?", name_cols_multi, key="multi_name_col"
+                    )
                     numeric_cols_multi = combined_df.select_dtypes(include=np.number).columns.tolist()
 
-                    if numeric_cols_multi:
+                    if not numeric_cols_multi:
+                        st.info("No shared numeric columns to track growth on.")
+                    else:
                         long_df = combined_df.melt(
                             id_vars=['__Semester__', name_col_multi], value_vars=numeric_cols_multi,
                             var_name='Subject', value_name='Score'
                         ).rename(columns={name_col_multi: 'Name'})
 
-                        search_name_multi = st.text_input("Student Name for Growth Trend", key="multi_search_name")
+                        semesters_sorted = sorted(combined_df['__Semester__'].unique())
+                        first_semester, last_semester = semesters_sorted[0], semesters_sorted[-1]
+
+                        st.markdown("#### Individual Growth Trend")
+                        search_name_multi = st.text_input(
+                            "Name to see growth across files", key="multi_search_name"
+                        )
+
+                        student_long = pd.DataFrame()
                         if search_name_multi:
-                            student_long = long_df[long_df['Name'].astype(str).str.strip().str.lower() == search_name_multi.strip().lower()]
-                            if not student_long.empty:
+                            student_long = long_df[
+                                long_df['Name'].astype(str).str.strip().str.lower() == search_name_multi.strip().lower()
+                            ]
+                            if student_long.empty:
+                                st.warning(f"No entry named '{search_name_multi}' found across the uploaded files.")
+                            else:
                                 fig_trend = px.line(
                                     student_long, x='__Semester__', y='Score', color='Subject', markers=True,
-                                    title=f"{search_name_multi}'s Multi-Semester Growth",
+                                    title=f"{search_name_multi}'s Growth Across Files",
                                     color_discrete_sequence=COLOR_SEQUENCE
                                 )
                                 fig_trend = apply_plotly_theme(fig_trend, dark_mode)
-                                st.plotly_chart(fig_trend, width='stretch')
+                                st.plotly_chart(fig_trend, use_container_width=True)
+
+                        st.markdown("#### Top 10 Growth (Overview)")
+                        avg_per_student_sem = long_df.groupby(['Name', '__Semester__'])['Score'].mean().reset_index()
+                        latest_scores = avg_per_student_sem[avg_per_student_sem['__Semester__'] == last_semester]
+                        top10_names = latest_scores.sort_values('Score', ascending=False).head(10)['Name'].tolist()
+                        top10_long = long_df[long_df['Name'].isin(top10_names)]
+
+                        scale_changed_subjects = [
+                            s for s in numeric_cols_multi
+                            if subject_scale_changed(long_df, s, first_semester, last_semester)
+                        ]
+
+                        growth_rows = []
+                        for student in top10_names:
+                            for subject in numeric_cols_multi:
+                                fv = top10_long[(top10_long['Name'] == student) & (top10_long['Subject'] == subject) &
+                                                 (top10_long['__Semester__'] == first_semester)]['Score']
+                                lv = top10_long[(top10_long['Name'] == student) & (top10_long['Subject'] == subject) &
+                                                 (top10_long['__Semester__'] == last_semester)]['Score']
+                                scale_changed = subject in scale_changed_subjects
+                                g = (growth_pct(fv.values[0], lv.values[0])
+                                     if not fv.empty and not lv.empty and not scale_changed else None)
+                                growth_rows.append({
+                                    'Name': student, 'Subject': subject, 'Growth %': g,
+                                    'Scale Changed?': 'Yes — max marks differ between semesters' if scale_changed else 'No'
+                                })
+
+                        growth_df = pd.DataFrame(growth_rows)
+                        if scale_changed_subjects:
+                            st.warning(
+                                f"⚠️ **{', '.join(scale_changed_subjects)}** appear to have a different maximum "
+                                f"score in {first_semester} vs. {last_semester} (e.g. out of 50 vs. out of 100). "
+                                "A raw % growth number would be misleading there — it's shown as blank for those "
+                                "subjects instead of a wrong number."
+                            )
+                        st.dataframe(growth_df, use_container_width=True)
+
+                        avg_growth_by_subject = growth_df.groupby('Subject')['Growth %'].mean().reset_index()
+                        fig_top10 = px.bar(avg_growth_by_subject, x='Subject', y='Growth %',
+                                            title="Top 10's Average Growth Rate by Subject",
+                                            color='Subject', color_discrete_sequence=COLOR_SEQUENCE)
+                        fig_top10 = apply_plotly_theme(fig_top10, dark_mode)
+                        st.plotly_chart(fig_top10, use_container_width=True)
+
+                        if search_name_multi and not student_long.empty:
+                            st.markdown("#### Searched Entity vs. Top 10 Growth")
+                            searched_rows = []
+                            for subject in numeric_cols_multi:
+                                fs = student_long[(student_long['Subject'] == subject) &
+                                                   (student_long['__Semester__'] == first_semester)]['Score']
+                                ls = student_long[(student_long['Subject'] == subject) &
+                                                   (student_long['__Semester__'] == last_semester)]['Score']
+                                scale_changed = subject_scale_changed(long_df, subject, first_semester, last_semester)
+                                g = (growth_pct(fs.values[0], ls.values[0])
+                                     if not fs.empty and not ls.empty and not scale_changed else None)
+                                searched_rows.append({'Subject': subject, 'Growth %': g, 'Who': search_name_multi})
+
+                            searched_growth_df = pd.DataFrame(searched_rows)
+                            top10_avg_labeled = avg_growth_by_subject.copy()
+                            top10_avg_labeled['Who'] = 'Top 10 Average'
+                            compare_df = pd.concat(
+                                [searched_growth_df, top10_avg_labeled[['Subject', 'Growth %', 'Who']]], ignore_index=True
+                            )
+                            fig_compare = px.bar(compare_df, x='Subject', y='Growth %', color='Who', barmode='group',
+                                                  title=f"{search_name_multi} vs. Top 10 Average Growth Rate",
+                                                  color_discrete_sequence=COLOR_SEQUENCE)
+                            fig_compare = apply_plotly_theme(fig_compare, dark_mode)
+                            st.plotly_chart(fig_compare, use_container_width=True)
 
     # -------------------- TAB: DATA CLEANING --------------------
     with tab_clean:
         st.subheader(f"Data Cleaning: {primary_label}")
+        st.caption("Light-touch cleanup tools. Nothing here overwrites your uploaded file — "
+                   "download the cleaned result when you're happy with it.")
+
         oc1, oc2 = st.columns(2)
         with oc1:
             drop_dupes = st.checkbox("Remove duplicate rows", value=False)
             strip_whitespace = st.checkbox("Trim whitespace in text columns", value=True)
             drop_empty_cols = st.checkbox("Drop fully-empty columns", value=False)
         with oc2:
-            fillna_strategy = st.selectbox("Fill missing values using…", ["None", "Mean", "Median", "Zero"])
+            fillna_strategy = st.selectbox("Fill missing values using…",
+                                            ["None", "Mean", "Median", "Zero"])
+            st.caption(
+                "⚠️ There's no 'Forward fill' option here on purpose: for records like exam marks, "
+                "a blank cell usually means the person was absent, not that they scored whatever the "
+                "row above them scored. Filling it with the previous row's value would silently "
+                "fabricate a mark for them. Mean/Median/Zero don't have that specific failure mode, "
+                "but even they can distort things — if a student was genuinely absent, consider leaving "
+                "that cell blank and excluding them from that column's calculations instead of filling it."
+            )
             fillna_cols = []
             if fillna_strategy != "None":
-                fillna_cols = st.multiselect("Columns to fill", df.columns.tolist(), default=[c for c in numeric_cols if df[c].isna().any()])
+                fillna_cols = st.multiselect("Columns to fill", df.columns.tolist(),
+                                              default=[c for c in numeric_cols if df[c].isna().any()])
 
-        cleaned_df, change_log = clean_dataframe(df, drop_dupes, fillna_strategy, fillna_cols, drop_empty_cols, strip_whitespace)
+        cleaned_df, change_log = clean_dataframe(df, drop_dupes, fillna_strategy, fillna_cols,
+                                                  drop_empty_cols, strip_whitespace)
+
+        st.markdown("#### Change Log")
         for entry in change_log:
             st.markdown(f"<div class='dv-insight'>✅ {entry}</div>", unsafe_allow_html=True)
 
-        st.dataframe(cleaned_df, width='stretch')
-        st.download_button("⬇️ Download cleaned CSV", cleaned_df.to_csv(index=False).encode("utf-8"), file_name="cleaned_data.csv")
+        st.markdown("#### Outlier Detection (IQR method)")
+        st.caption("Flags values far outside the normal range for each numeric column — often the "
+                   "fastest way to spot data-entry errors.")
+        if numeric_cols:
+            outlier_summary, outlier_mask = detect_outliers_iqr(cleaned_df, numeric_cols)
+            if outlier_summary.empty:
+                st.info("No column had enough spread to flag outliers.")
+            else:
+                st.dataframe(outlier_summary, use_container_width=True)
+                n_flagged = int(outlier_mask.sum())
+                if n_flagged:
+                    with st.expander(f"🚩 {n_flagged} row(s) flagged as an outlier on at least one column"):
+                        st.dataframe(cleaned_df[outlier_mask], use_container_width=True)
+                else:
+                    st.success("No individual rows flagged as outliers.")
+        else:
+            st.info("No numeric columns to check for outliers.")
+
+        st.markdown("#### Preview & Download")
+        st.dataframe(cleaned_df, use_container_width=True, height=min(420, 60 + 35 * min(len(cleaned_df), 10)))
+        st.download_button(
+            "⬇️ Download cleaned data (CSV)",
+            cleaned_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"cleaned_{str(primary_label).replace('/', '_')}.csv",
+            mime="text/csv"
+        )
 
     # -------------------- TAB: EXPORT REPORT --------------------
     with tab_export:
-        st.subheader("Export Combined Multi-Sheet Excel Report")
-        if EXCEL_EXPORT_SUPPORT:
+        st.subheader("Export a Combined Report")
+        st.caption("Bundles every uploaded file's raw data, plus summary statistics and the correlation "
+                   "matrix for the active dataset, into one Excel workbook — handy for sharing or archiving.")
+
+        if not EXCEL_EXPORT_SUPPORT:
+            st.warning("Excel export requires the `openpyxl` package, which isn't installed here.")
+        else:
+            st.markdown(
+                f"<div class='dv-card'>Workbook will include:<br>"
+                f"• {len(named_dfs)} raw data sheet(s)<br>"
+                f"• 1 summary statistics sheet (active dataset: <b>{primary_label}</b>)<br>"
+                f"• 1 correlation matrix sheet (if ≥2 numeric columns)</div>",
+                unsafe_allow_html=True
+            )
             report_buffer = build_excel_report(named_dfs, primary_label, df, numeric_cols)
             st.download_button(
                 "⬇️ Download Excel report (.xlsx)",
@@ -1526,14 +1385,38 @@ if named_dfs:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
+        st.divider()
+        st.markdown("#### Export current chart")
+        st.caption("Grab the latest chart built on the Explore & Customize tab as a standalone HTML file "
+                   "from the download button on that tab, or export any Plotly chart as PNG using the "
+                   "camera icon in its top-right toolbar.")
+
     # -------------------- TAB: AI INSIGHTS --------------------
     with tab_ai:
         st.subheader(f"AI-Generated Insights: {primary_label}")
-        if api_key:
-            include_raw = st.checkbox("Include row-level data for entity callouts", value=False)
+        if not AI_SUPPORT:
+            st.info("AI insights require `langchain_anthropic`, which isn't installed in this environment.")
+        elif api_key:
+            st.caption(
+                "By default, only column names and summary statistics (means, quartiles, etc.) are sent "
+                "to Claude — never the row-level data itself, so no individual's name or score leaves the app."
+            )
+            include_raw = st.checkbox(
+                "Also include row-level data, so the AI can call out specific rows/entities by name "
+                "(names will be anonymized as 'Entity 1', 'Entity 2', etc. before sending, and translated "
+                "back for display here — but this does still send every row's numeric values to Anthropic's API)",
+                value=False
+            )
+            if include_raw:
+                st.warning(
+                    "⚠️ This will send every row of this dataset's data (with names replaced by placeholders) "
+                    "to Anthropic's API. If this data is about other people (e.g. classmates), make sure "
+                    "you're comfortable sharing their scores this way before continuing."
+                )
             if st.button('Generate AI Summary'):
                 with st.spinner('Analyzing data...'):
-                    summary, error = get_ai_summary(df, api_key, name_col=non_numeric_cols[0] if (include_raw and non_numeric_cols) else None, include_raw_rows=include_raw)
+                    ai_name_col = non_numeric_cols[0] if (include_raw and non_numeric_cols) else None
+                    summary, error = get_ai_summary(df, api_key, name_col=ai_name_col, include_raw_rows=include_raw)
                 if error:
                     st.error(f"Couldn't generate summary: {error}")
                 else:
@@ -1543,8 +1426,12 @@ if named_dfs:
 
 else:
     with tab_dash:
-        st.info('Upload a CSV, Excel, or PDF file in the sidebar (or click "Load Sample Student Marks Dataset") to get started.')
-    with tab_grades:
-        st.info('Upload a dataset to see the Leaderboard and Grade breakdown.')
+        st.info('Upload a CSV, Excel, or PDF file in the sidebar to see your dashboard.')
     with tab_charts:
-        st.info('Upload a file to build custom charts.')
+        st.info('Upload a CSV, Excel, or PDF file in the sidebar to get started.')
+    with tab_raw:
+        st.info('Upload a file to see its raw data here.')
+    with tab_clean:
+        st.info('Upload a file to use the data cleaning tools.')
+    with tab_export:
+        st.info('Upload a file to build an exportable report.')
